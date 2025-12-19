@@ -1,10 +1,11 @@
 import pandas as pd
 import yfinance as yf
 class DataCollector:
-    def __init__(self, tickers, beg, end):
+    def __init__(self, tickers, beg, end, interval):
         self.tickers = tickers
         self.beg = beg
         self.end = end
+        self.interval = "1d"
 
     def get_prices(self):
         data = None
