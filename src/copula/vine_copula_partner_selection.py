@@ -4,12 +4,15 @@ Module for implementing partner selection approaches for vine copulas.
 
 import functools
 import itertools
+import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from joblib import Parallel, delayed
+from concurrent.futures import ThreadPoolExecutor
 
-from src.copula.vine_copula_partner_selection_utils import extremal_measure, get_quantiles_data, \
+from src.copula.vine_copula_partner_selection_utils import extremal_measure, extremal_measure_vectorized, get_quantiles_data, \
     get_co_variance_matrix, get_sum_correlations_vectorized, diagonal_measure_vectorized, multivariate_rho_vectorized
 
 
@@ -27,28 +30,36 @@ class PartnerSelection:
     <https://www.econstor.eu/bitstream/10419/147450/1/870932616.pdf>`__
     """
 
-    def __init__(self, prices: pd.DataFrame, n: int = 50):
+    def __init__(self, data: pd.DataFrame, is_prices: bool = True, n: int = 50):
         """
-        Inputs the price series required for further calculations.
+        Inputs the price or return series required for further calculations.
 
         It also includes preprocessing steps described in the paper, before starting the Partner Selection procedures.
         These steps include, finding the returns and ranked returns of the stocks, and calculating the top n
         correlated stocks for each stock in the universe.
 
-        :param prices: (pd.DataFrame) Contains price series of all stocks in the universe.
+        :param data: (pd.DataFrame) Contains either price series (if is_prices=True) or return series
+            (if is_prices=False) for all stocks in the universe.
+        :param is_prices: (bool) True if data contains prices (default), False if data contains returns.
         :param n: (int) For each target stock, the total number of stocks taken into consideration for partner stocks
             in the final combination, from 500 stocks in the universe.
         """
 
-        if len(prices) == 0:
-            raise Exception("Input does not contain any data.")
+        if not isinstance(data, pd.DataFrame):
+            raise TypeError("PartnerSelection requires a pandas DataFrame as input.")
+        if data.empty:
+            raise ValueError("Input DataFrame is empty.")
 
-        if not isinstance(prices, pd.DataFrame):
-            raise Exception("Partner Selection Class requires a pandas DataFrame as input.")
+        self.num_stocks_per_target = n
 
-        self.universe = prices  # Contains daily prices for all stocks in universe
-        self.num_stocks_per_target = n # Total number of stocks taken into consideration as partner stocks for each target
-        self.returns, self.ranked_returns = self._get_returns()  # Daily returns and corresponding ranked returns
+        if is_prices:
+            self.prices = data
+            self.returns = self._compute_returns()
+        else:
+            self.prices = None  # prices not available; plotting will not be supported
+            self.returns = data
+
+        self.ranked_returns = self._get_ranked_returns()  # Daily ranked returns
 
         # Correlation matrix containing all stocks in universe
         self.correlation_matrix = self._correlation()
@@ -64,23 +75,31 @@ class PartnerSelection:
         :return: (pd.DataFrame) Correlation Matrix.
         """
 
+        # np.corrcoef(smp, rowvar = False) # this method is faster
         return self.ranked_returns.corr(method='pearson')  # Pearson or spearman, we get same results as input is ranked
 
-    def _get_returns(self) -> (pd.DataFrame, pd.DataFrame):
-        """
-        Calculating daily returns and ranked daily returns of the stocks.
 
-        :return (tuple):
-            returns_df : (pd.DataFrame) Dataframe consists of daily returns.
+    def _compute_returns(self) -> pd.DataFrame:
+        """
+        Calculates daily percentage returns from price data.
+
+        :return (pd.DataFrame): Dataframe of daily returns.
+        """
+        returns_df = self.prices.pct_change()
+        returns_df = returns_df.replace([np.inf, -np.inf], np.nan).ffill().dropna()
+        return returns_df
+
+    def _get_ranked_returns(self) -> pd.DataFrame:
+        """
+        Calculating ranked daily returns of the stocks.
+
+        :return (pd.DataFrame):
             returns_df_ranked : (pd.DataFrame) Dataframe consists of ranked daily returns between [0,1].
         """
 
-        returns_df = self.universe.pct_change()
-        returns_df = returns_df.replace([np.inf, -np.inf], np.nan).ffill().dropna()
-
         # Calculating rank of daily returns for each stock. 'first' method is used to assign ranks in order they appear
-        returns_df_ranked = returns_df.rank(axis=0, method='first', pct=True)
-        return returns_df, returns_df_ranked
+        returns_df_ranked = self.returns.rank(axis=0, method='first', pct=True)
+        return returns_df_ranked
 
     def _tickers_list(self, col: pd.Series) -> list:
         """
@@ -100,6 +119,7 @@ class PartnerSelection:
         :return: (pd.DataFrame) Dataframe consisting of n columns for each stock in the universe.
         """
 
+        # TODO: make this function faster
         # Returns DataFrame with all stocks as indices and their respective top n correlated stocks as columns
         return self.correlation_matrix.apply(self._tickers_list, axis=0).T
 
@@ -232,8 +252,74 @@ class PartnerSelection:
 
         return output_matrix
 
+    def _score_target(self, target, combos_idx, co_variance_matrix):
+        """
+        Scores all quadruple combinations for a single target stock using the extremal measure.
+
+        :param target: (str) Ticker of the target stock.
+        :param combos_idx: (np.ndarray) Integer index array of shape (n_combos, d) representing all
+            quadruple combinations to evaluate, where index 0 always refers to the target stock.
+        :param co_variance_matrix: (np.ndarray) Precomputed inverted covariance matrix for the extremal measure.
+        :return: (list) The quadruple (list of tickers) with the highest extremal measure score.
+        """
+        stock_selection = [target] + self.top_n_correlations.loc[target].tolist()
+        u = self.ranked_returns[stock_selection].values  # (n_time, n_stocks+1)
+        scores = extremal_measure_vectorized(u, combos_idx, co_variance_matrix)
+        max_idx = int(np.argmax(scores))
+        return [stock_selection[i] for i in combos_idx[max_idx]]
+
     # Method 4
     def extremal(self, n_targets: int = 5, d: int = 4) -> list:
+        """
+        This method implements the fourth procedure described in Section 3.1.1.
+
+        It involves calculating a non-parametric test statistic based on
+        `Mangold (2015) <https://www.statistik.rw.fau.de/files/2016/03/IWQW-10-2015.pdf>`__ to measure the
+        degree of deviation from independence. Main focus of this measure is the occurrence of joint extreme events.
+
+        :param n_targets: (int) Number of target stocks to select.
+        :param d: (int) Number of partner stocks(including target stock).
+        :return output_matrix: (list) List of all selected combinations.
+        """
+
+        if d > self.num_stocks_per_target or d < 2:
+            raise Exception("Please make sure number of partner stocks d is 2<=d<=n.")
+
+        co_variance_matrix = get_co_variance_matrix(d)
+
+        # Precompute integer combination indices once — same structure for every target.
+        # Use range() so elements are plain Python ints, not numpy scalars.
+        combos_idx = np.array(
+            [[0] + list(c) for c in itertools.combinations(range(1, self.num_stocks_per_target + 1), d - 1)]
+        )
+
+        targets = self.top_n_correlations.index[:n_targets].tolist()
+
+        def _score_target(target):
+            stock_selection = [target] + self.top_n_correlations.loc[target].tolist()
+            u = self.ranked_returns[stock_selection].values  # (n_time, n_stocks+1)
+            scores = extremal_measure_vectorized(u, combos_idx, co_variance_matrix)
+            max_idx = int(np.argmax(scores))
+            return [stock_selection[i] for i in combos_idx[max_idx]]
+
+        n_workers = min(n_targets, os.cpu_count() or 4)
+
+        # output_matrix = Parallel(n_jobs = n_workers, prefer = 'threads')(
+        #     delayed(self._score_target)(target, combos_idx, co_variance_matrix)
+        #     for target in targets
+        # )
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            output_matrix = list(executor.map(_score_target, targets))
+
+        # output_matrix = [
+        #     self._score_target(target, combos_idx, co_variance_matrix)
+        #     for target in targets
+        # ]
+
+        return output_matrix
+
+    def extremal_legacy(self, n_targets: int = 5, d: int = 4) -> list:
         """
         This method implements the fourth procedure described in Section 3.1.1.
 
@@ -272,9 +358,16 @@ class PartnerSelection:
         """
         For the list of quadruples, this method plots the line plots of the cumulative returns of all stocks in quadruple.
 
+        Requires the class to have been initialized with price data (is_prices=True).
+
         :param quadruples: (list) List of quadruples.
         :return: (list) List of Axes objects.
         """
+
+        if self.prices is None:
+            raise ValueError(
+                "Plotting requires price data. Re-initialize with is_prices=True and pass a price DataFrame."
+            )
 
         if len(quadruples) == 0:
             raise Exception("Input list is empty.")
@@ -285,13 +378,13 @@ class PartnerSelection:
 
         if len(quadruples) == 1:
             quadruple = quadruples[0]
-            data = self.universe.loc[:, quadruple].apply(lambda x: np.log(x).diff()).cumsum()
+            data = self.prices.loc[:, quadruple].apply(lambda x: np.log(x).diff()).cumsum()
             sns.lineplot(ax=axs, data=data, legend=quadruple)
             axs.set_title(f'Final Quadruple of stocks with {quadruple[0]} as target')
             axs.set_ylabel('Cumulative Daily Returns')
         else:
             for i, quadruple in enumerate(quadruples):
-                data = self.universe.loc[:, quadruple].apply(lambda x: np.log(x).diff()).cumsum()
+                data = self.prices.loc[:, quadruple].apply(lambda x: np.log(x).diff()).cumsum()
                 sns.lineplot(ax=axs[i], data=data, legend=quadruple)
                 axs[i].set_title(f'Final Quadruple of stocks with {quadruple[0]} as target')
                 axs[i].set_ylabel('Cumulative Daily Returns')

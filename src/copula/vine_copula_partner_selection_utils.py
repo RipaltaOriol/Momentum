@@ -3,6 +3,7 @@ Utils for implementing partner selection approaches for vine copulas.
 """
 
 from contextlib import suppress
+import functools
 import itertools
 import numpy as np
 import pandas as pd
@@ -160,6 +161,43 @@ def extremal_measure(u: pd.DataFrame, co_variance_matrix: np.array):
     return t_test_statistic[0, 0]
 
 
+def extremal_measure_vectorized(u: np.ndarray, combos_idx: np.ndarray, co_variance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Vectorized extremal measure for all combinations simultaneously.
+
+    Replaces the Python loop over individual :func:`extremal_measure` calls with a single
+    batched numpy computation, following the same pattern as :func:`get_sum_correlations_vectorized`.
+
+    :param u: (np.ndarray) Ranked returns of shape (n_time, n_stocks).
+    :param combos_idx: (np.ndarray) Integer column indices of shape (n_combs, d).
+    :param co_variance_matrix: (np.ndarray) Inverted covariance matrix of shape (2**d, 2**d).
+    :return: (np.ndarray) Test statistic for every combination, shape (n_combs,).
+    """
+    n_time = u.shape[0]
+    n_combs, d = combos_idx.shape
+
+    # Precompute both variable forms for every stock column: (n_time, n_stocks, 2)
+    # Index 0 → form1 (l=1): differential of t*(1-t)^2
+    # Index 1 → form2 (l=2): differential of t^2*(1-t)
+    form1 = (u - 1) * (3 * u - 1)
+    form2 = u * (2 - 3 * u)
+    forms = np.stack([form1, form2], axis=-1)  # (n_time, n_stocks, 2)
+
+    # Build T matrix of shape (2**d, n_combs).
+    # Each of the 2**d rows corresponds to one element of {1,2}^d (the l-vector).
+    T = np.empty((2 ** d, n_combs))
+    for row_idx, l in enumerate(itertools.product([0, 1], repeat=d)):
+        res = np.ones((n_time, n_combs))
+        for dim_idx, form_idx in enumerate(l):
+            # forms[:, combos_idx[:, dim_idx], form_idx] → (n_time, n_combs)
+            res *= forms[:, combos_idx[:, dim_idx], form_idx]
+        T[row_idx] = res.mean(axis=0)
+
+    # Compute n * t^T @ cov_inv @ t for all combinations in one einsum
+    return np.einsum('ic,ij,jc->c', T, co_variance_matrix, T) * n_time
+
+
+@functools.lru_cache(maxsize=None)
 def get_co_variance_matrix(d: int):
     """
     Calculates 2**d x 2**d dimensional covariance matrix. Since the matrix is symmetric, only the integrals
